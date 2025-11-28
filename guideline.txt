@@ -1,0 +1,5 @@
+Run venv:
+source venv/bin/activate
+
+Run program:
+python passport_ocr.py
