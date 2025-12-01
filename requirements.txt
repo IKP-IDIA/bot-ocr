@@ -1,7 +1,7 @@
 fastapi==0.104.1
 uvicorn[standard]==0.24.0
 torch==2.9.0
-torchvision==0.16.0
+torchvision==0.24.0
 transformers==4.45.0
 pillow==10.1.0
 pymupdf==1.23.8
