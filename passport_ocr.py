@@ -1,4 +1,4 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
 from transformers import AutoModelForVision2Seq, AutoProcessor
 from qwen_vl_utils import process_vision_info
@@ -8,44 +8,82 @@ import re
 import fitz  # PyMuPDF
 import os
 import json
-from typing import Dict, List
+from typing import Dict, List, Optional
 import torch
 from contextlib import asynccontextmanager
+import logging
+import asyncio
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Global variables for model
 model = None
 processor = None
+model_loading = False
+model_load_error = None
 
-def load_typhoon_model():
-    """Load Typhoon OCR model"""
-    global model, processor
+async def load_typhoon_model_async():
+    """Load Typhoon OCR model asynchronously"""
+    global model, processor, model_loading, model_load_error
     
-    print("Loading Typhoon OCR model...")
-    model_name = "scb10x/typhoon-ocr1.5-2b"
+    if model is not None:
+        return
     
-    # Determine device and dtype
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    if model_loading:
+        return
     
-    print(f"Using device: {device}, dtype: {dtype}")
+    model_loading = True
     
-    processor = AutoProcessor.from_pretrained(
-        model_name,
-        trust_remote_code=True
-    )
-    model = AutoModelForVision2Seq.from_pretrained(
-        model_name,
-        torch_dtype=dtype,
-        device_map="auto",
-        trust_remote_code=True
-    ).eval()
-    
-    if torch.cuda.is_available():
-        print(f"Model loaded on GPU: {torch.cuda.get_device_name(0)}")
-    else:
-        print("Model loaded on CPU")
-    
-    print("Model loaded successfully!")
+    try:
+        logger.info("Starting Typhoon OCR model loading...")
+        model_name = "scb10x/typhoon-ocr1.5-2b"
+        
+        # Determine device and dtype
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        
+        logger.info(f"Using device: {device}, dtype: {dtype}")
+        
+        # Load processor first (faster)
+        logger.info("Loading processor...")
+        processor = AutoProcessor.from_pretrained(
+            model_name,
+            trust_remote_code=True
+        )
+        
+        # Load model with optimizations
+        logger.info("Loading model (this may take 2-5 minutes)...")
+        model = AutoModelForVision2Seq.from_pretrained(
+            model_name,
+            torch_dtype=dtype,
+            device_map="auto",
+            trust_remote_code=True,
+            low_cpu_mem_usage=True,  # Optimize memory usage
+        ).eval()
+        
+        # Optimize for inference
+        if torch.cuda.is_available():
+            logger.info(f"Model loaded on GPU: {torch.cuda.get_device_name(0)}")
+        else:
+            logger.info("Model loaded on CPU - inference will be slower")
+            # For CPU, we can try to optimize further
+            try:
+                model = torch.compile(model, mode="reduce-overhead")
+                logger.info("Model compiled with torch.compile")
+            except Exception as e:
+                logger.warning(f"Could not compile model: {e}")
+        
+        logger.info("Model loaded successfully!")
+        model_loading = False
+        
+    except Exception as e:
+        model_load_error = str(e)
+        model_loading = False
+        logger.error(f"Failed to load model: {e}")
+        import traceback
+        traceback.print_exc()
 
 def resize_if_needed(img, max_size=1800):
     """Resize image if needed (Typhoon OCR is trained with 1800px max)"""
@@ -58,7 +96,7 @@ def resize_if_needed(img, max_size=1800):
             scale = max_size / float(height)
             new_size = (int(width * scale), max_size)
         img = img.resize(new_size, Image.Resampling.LANCZOS)
-        print(f"Resized from {(width, height)} to {img.size}")
+        logger.info(f"Resized from {(width, height)} to {img.size}")
     return img
 
 def get_typhoon_prompt():
@@ -106,7 +144,7 @@ def extract_text_from_image(image: Image.Image) -> str:
         )
         inputs = inputs.to(model.device)
         
-        # Generate
+        # Generate with timeout protection
         with torch.no_grad():
             generated_ids = model.generate(**inputs, max_new_tokens=16000)
             generated_ids_trimmed = [
@@ -137,6 +175,7 @@ def extract_text_from_image(image: Image.Image) -> str:
             return output_text
         
     except Exception as e:
+        logger.error(f"OCR extraction failed: {str(e)}")
         import traceback
         traceback.print_exc()
         raise Exception(f"OCR extraction failed: {str(e)}")
@@ -250,10 +289,13 @@ def identify_passport_fields(text: str) -> Dict[str, any]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Load model on startup"""
-    load_typhoon_model()
+    """Handle startup and shutdown"""
+    # Start loading model in background - don't wait for it
+    asyncio.create_task(load_typhoon_model_async())
+    logger.info("Model loading initiated in background")
     yield
     # Cleanup if needed
+    logger.info("Shutting down...")
 
 app = FastAPI(title="Passport OCR API", lifespan=lifespan)
 
@@ -263,11 +305,25 @@ async def root():
         "message": "Passport OCR API with Typhoon",
         "status": "running",
         "model": "typhoon-ocr1.5-2b",
+        "model_status": "loaded" if model is not None else ("loading" if model_loading else "not_loaded"),
         "endpoints": {
             "POST /extract": "Extract text and identify passport fields from image/PDF",
-            "GET /health": "Check API health and model status"
+            "GET /health": "Check API health and model status",
+            "POST /load-model": "Manually trigger model loading"
         }
     }
+
+@app.post("/load-model")
+async def trigger_model_load(background_tasks: BackgroundTasks):
+    """Manually trigger model loading"""
+    if model is not None:
+        return {"status": "already_loaded"}
+    
+    if model_loading:
+        return {"status": "loading_in_progress"}
+    
+    background_tasks.add_task(load_typhoon_model_async)
+    return {"status": "loading_started"}
 
 @app.post("/extract")
 async def extract_passport(file: UploadFile = File(...)):
@@ -277,8 +333,25 @@ async def extract_passport(file: UploadFile = File(...)):
     Supports: PDF, PNG, JPG, JPEG files
     """
     
+    # Check model status
     if model is None:
-        raise HTTPException(status_code=503, detail="Model not loaded yet")
+        if model_loading:
+            raise HTTPException(
+                status_code=503, 
+                detail="Model is still loading. Please try again in a few moments."
+            )
+        elif model_load_error:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Model failed to load: {model_load_error}"
+            )
+        else:
+            # Try to start loading
+            asyncio.create_task(load_typhoon_model_async())
+            raise HTTPException(
+                status_code=503, 
+                detail="Model not loaded. Loading has been initiated. Please try again in 2-3 minutes."
+            )
     
     # Validate file type
     allowed_extensions = {'.pdf', '.png', '.jpg', '.jpeg'}
@@ -309,7 +382,7 @@ async def extract_passport(file: UploadFile = File(...)):
         all_results = []
         
         for idx, image in enumerate(images):
-            print(f"Processing page {idx + 1}/{len(images)}...")
+            logger.info(f"Processing page {idx + 1}/{len(images)}...")
             extracted_text = extract_text_from_image(image)
             all_text.append(extracted_text)
             
@@ -334,19 +407,26 @@ async def extract_passport(file: UploadFile = File(...)):
         return JSONResponse(content=combined_result)
         
     except Exception as e:
+        logger.error(f"Processing error: {str(e)}")
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}")
 
 @app.get("/health")
 async def health_check():
+    """Health check endpoint for Railway"""
     return {
         "status": "healthy",
         "model_loaded": model is not None,
+        "model_loading": model_loading,
+        "model_load_error": model_load_error,
         "gpu_available": torch.cuda.is_available(),
         "gpu_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
     }
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="10.1.0.150", port=8000)
+    # Use PORT environment variable for Railway
+    port = int(os.environ.get("PORT", 8000))
+    host = os.environ.get("HOST", "10.1.0.150")
+    uvicorn.run(app, host=host, port=port)
